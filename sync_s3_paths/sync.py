@@ -151,7 +151,7 @@ class S3PutObjectResponse(TypedDict):
 def S3Uploader(prefix: S3Prefix, key: str, downloaded: DownloadResult) -> UploadResult:
     session = prefix.get_session()
     s3 = session.client("s3")
-    # We can't stream directly from a get objec to a put object, boto3 tries to read the objec to
+    # We can't stream directly from a get object to a put object, boto3 tries to read the object to
     # calculate the MD5, then seek() back. To mitigate this try to read ourselves, spooling to disk
     # as needed.
     # It's a shame you can't upload, get the checksum back and compare after the fact.

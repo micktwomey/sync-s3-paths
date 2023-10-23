@@ -1,0 +1,31 @@
+[tool.poetry]
+name = "sync-s3-paths"
+version = "0.1.0"
+description = "Sync across S3 buckets and accounts"
+authors = ["Michael Twomey <mick@twomeylee.name>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.11,<4.0"
+boto3 = "^1.28.67"
+rich = "^13.6.0"
+typer = "^0.9.0"
+psutil = "^5.9.6"
+
+
+[tool.poetry.group.dev.dependencies]
+ruff = "^0.1.1"
+black = "^23.10.0"
+mypy = "^1.6.1"
+pytest = "^7.4.2"
+pudb = "^2023.1"
+py-spy = "^0.3.14"
+pre-commit = "^3.5.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+sync-s3-paths = "sync_s3_paths.main:app"

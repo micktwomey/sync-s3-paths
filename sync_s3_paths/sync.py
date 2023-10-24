@@ -1,15 +1,17 @@
 import datetime
 from dataclasses import dataclass
-from io import BufferedReader, BytesIO, BufferedIOBase
-from typing import Callable, Iterable, TypedDict
+from io import BufferedReader, BytesIO
+from typing import Callable, Iterable, TypedDict, IO, Any
 import hashlib
 import tempfile
 import base64
 
 import boto3
 import botocore.response
-from rich import print
+import structlog
 import psutil
+
+LOG: structlog.stdlib.BoundLogger = structlog.get_logger()
 
 
 @dataclass
@@ -37,6 +39,7 @@ class S3Prefix:
 class Comparison:
     only_in_source: set[str]
     only_in_destination: set[str]
+    common: set[str]
     different: set[str]
 
     @property
@@ -64,7 +67,7 @@ class DownloadResult:
     content_type: str
     metadata: dict[str, str]
     etag: str | None
-    data: botocore.response.StreamingBody | BufferedReader
+    data: botocore.response.StreamingBody | BufferedReader | BytesIO
 
 
 Downloader = Callable[[S3Prefix, str], DownloadResult]
@@ -110,7 +113,7 @@ def S3Downloader(prefix: S3Prefix, key: str) -> DownloadResult:
         Bucket=prefix.bucket,
         Key=prefix.get_key(key),
     )
-    print(response)
+    LOG.debug("s3.get-object.response", response=response)
     return DownloadResult(
         bucket=prefix.bucket,
         key=prefix.get_key(key),
@@ -161,12 +164,13 @@ def S3Uploader(prefix: S3Prefix, key: str, downloaded: DownloadResult) -> Upload
     # TODO: make this tunable but for now limit ourselves to 5% or 1MiB of memory max
     available_memory = max(int(psutil.virtual_memory().available * 0.05), 1024**2)
 
-    buffer: BufferedIOBase
+    buffer: IO[Any]  # Using this type to keep boto3-stubs happy
     with tempfile.TemporaryFile() as fp:
         if downloaded.size <= available_memory:
-            print(f"Storing {key} in memory")
+            LOG.debug(f"Storing {key} in memory")
             buffer = BytesIO()
         else:
+            LOG.debug(f"Spooling {key} to disk")
             buffer = fp
 
         while True:
@@ -180,7 +184,7 @@ def S3Uploader(prefix: S3Prefix, key: str, downloaded: DownloadResult) -> Upload
 
         buffer.seek(0)
 
-        kwargs = dict(
+        response: S3PutObjectResponse = s3.put_object(
             Bucket=prefix.bucket,
             Body=buffer,
             ContentLength=downloaded.size,
@@ -191,9 +195,7 @@ def S3Uploader(prefix: S3Prefix, key: str, downloaded: DownloadResult) -> Upload
             ChecksumAlgorithm="SHA256",
             ContentMD5=base64.b64encode(md5.digest()).decode("ascii"),
         )
-        print(kwargs)
-        response: S3PutObjectResponse = s3.put_object(**kwargs)
-        print(response)
+        LOG.debug("s3.put-object.response", response=response)
         return UploadResult(
             bucket=prefix.bucket,
             size=downloaded.size,
@@ -204,19 +206,21 @@ def S3Uploader(prefix: S3Prefix, key: str, downloaded: DownloadResult) -> Upload
         )
 
 
-def list_keys_in_prefix(session: boto3.Session, prefix: S3Prefix) -> Iterable[Key]:
+def list_keys_in_prefix(
+    session: boto3.Session, prefix: S3Prefix, path: str
+) -> Iterable[Key]:
     s3 = session.client("s3")
 
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(
-        Bucket=prefix.bucket, Delimiter="", Prefix=prefix.prefix
+        Bucket=prefix.bucket, Delimiter="", Prefix=f"{prefix.prefix}/{path}/"
     ):
         if "Contents" not in page:
             continue
         for key in page["Contents"]:
             key_key = key["Key"]
-            assert key_key.startswith(prefix.prefix)
             if prefix.prefix is not None:
+                assert key_key.startswith(prefix.prefix)
                 key_key = key_key[len(prefix.prefix) :]
                 key_key = key_key[1:] if key_key.startswith("/") else key_key
                 assert not key_key.startswith("/")
@@ -228,18 +232,19 @@ def list_keys_in_prefix(session: boto3.Session, prefix: S3Prefix) -> Iterable[Ke
             )
 
 
-def compare_buckets(source: S3Prefix, dest: S3Prefix) -> Comparison:
+def compare_buckets(source: S3Prefix, dest: S3Prefix, path: str) -> Comparison:
     source_session = source.get_session()
     dest_session = dest.get_session()
 
     source_keys: dict[str, Key] = {}
-    for key in list_keys_in_prefix(source_session, source):
+    for key in list_keys_in_prefix(source_session, source, path):
         source_keys[key.key] = key
 
     dest_keys: dict[str, Key] = {}
-    for key in list_keys_in_prefix(dest_session, dest):
+    for key in list_keys_in_prefix(dest_session, dest, path):
         dest_keys[key.key] = key
 
+    common: set[str] = set()
     only_in_source: set[str] = set(source_keys).difference(set(dest_keys))
     only_in_dest: set[str] = set(dest_keys).difference(set(source_keys))
     different: set[str] = set()
@@ -250,12 +255,15 @@ def compare_buckets(source: S3Prefix, dest: S3Prefix) -> Comparison:
             source_key.last_modified > dest_key.last_modified
         ):
             different.add(key_key)
+        else:
+            common.add(key_key)
 
         # TODO: Compare etags, need to account for differences due to encryption at rest and multi part upload
         # See https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html#checking-object-integrity-etag-and-md5
         # See also aws s3 sync (which appears to use size and last modifed): https://github.com/aws/aws-cli/blob/develop/awscli/customizations/s3/syncstrategy/base.py
 
     return Comparison(
+        common=common,
         only_in_source=only_in_source,
         only_in_destination=only_in_dest,
         different=different,
@@ -270,9 +278,9 @@ def sync_key(
     uploader: Uploader,
 ) -> SyncResult:
     downloaded = downloader(source, key)
-    print(downloaded)
+    LOG.debug("downloaded", downloaded=downloaded)
     uploaded = uploader(dest, key, downloaded)
-    print(uploaded)
+    LOG.debug("uploaded", uploaded=uploaded)
     return SyncResult(
         source=source,
         dest=dest,

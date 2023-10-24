@@ -9,7 +9,8 @@ Essentially: S3 bucket source -> your machine -> S3 bucket target.
 # TODO
 
 - [X] Make it work for the simple case across two accounts
+- [ ] Add structlog
+- [ ] Implement S3 API requests directly, removing need for boto3
 - [ ] Make it asynchronous
 - [ ] Add parallelisation
-- [ ] Implement S3 API requests directly, removing need for boto3
 - [ ] Add task manager and rate limit adjustment to maximise throughput

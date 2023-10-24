@@ -1,7 +1,7 @@
 import datetime
 from dataclasses import dataclass
 from io import BufferedReader, BytesIO
-from typing import Callable, Iterable, TypedDict, IO, Any
+from typing import Callable, Iterable, TypedDict, IO, Any, Protocol, cast
 import hashlib
 import tempfile
 import base64
@@ -73,6 +73,25 @@ class DownloadResult:
     data: botocore.response.StreamingBody | BufferedReader | BytesIO
 
 
+class S3Client(Protocol):
+    def get_object(self, Bucket: str, Key: str) -> "S3GetObjectResponse":
+        ...
+
+    def put_object(
+        self,
+        Bucket: str,
+        Body: IO[Any],
+        ContentLength: int,
+        ContentType: str,
+        Key: str,
+        Metadata: dict[str, str],
+        ChecksumSHA256: str,
+        ChecksumAlgorithm: str,
+        ContentMD5: str,
+    ) -> "S3PutObjectResponse":
+        ...
+
+
 Downloader = Callable[[S3Prefix, str], DownloadResult]
 
 
@@ -113,7 +132,7 @@ class S3GetObjectResponse(TypedDict):
 
 def S3Downloader(prefix: S3Prefix, key: str) -> DownloadResult:
     session = prefix.get_session()
-    s3 = session.client("s3")
+    s3: S3Client = cast(S3Client, session.client("s3"))
     response: S3GetObjectResponse = s3.get_object(
         Bucket=prefix.bucket,
         Key=prefix.get_key(key),
@@ -160,7 +179,7 @@ class S3PutObjectResponse(TypedDict):
 
 def S3Uploader(prefix: S3Prefix, key: str, downloaded: DownloadResult) -> UploadResult:
     session = prefix.get_session()
-    s3 = session.client("s3")
+    s3: S3Client = cast(S3Client, session.client("s3"))
     # We can't stream directly from a get object to a put object, boto3 tries to read the object to
     # calculate the MD5, then seek() back. To mitigate this try to read ourselves, spooling to disk
     # as needed.

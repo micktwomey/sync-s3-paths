@@ -1,22 +1,28 @@
-from dataclasses import dataclass
+import asyncio
 import logging
-from urllib.parse import urlparse
+from dataclasses import dataclass
 from typing import Annotated
+from urllib.parse import urlparse
 
 import rich.traceback
-from rich.progress import Progress
+import psutil
 import structlog
 import typer
+from rich.progress import Progress
 
 from .sync import (
-    S3Prefix,
-    compare_buckets,
-    Key,
-    sync_key,
+    Comparison,
+    Downloader,
     DryRunDownloader,
     DryRunUploader,
+    Key,
     S3Downloader,
+    S3Prefix,
     S3Uploader,
+    Uploader,
+    compare_buckets,
+    sync_key,
+    SyncResult,
 )
 
 LOG: structlog.stdlib.BoundLogger = structlog.get_logger()
@@ -67,6 +73,91 @@ def compare(
     )
 
 
+@dataclass
+class SyncEvent:
+    source: S3Prefix
+    dest: S3Prefix
+    key: str
+    downloader: Downloader
+    uploader: Uploader
+
+
+async def sync_worker(
+    name: str,
+    inbox: asyncio.Queue[SyncEvent],
+    outbox: asyncio.Queue[SyncResult],
+    is_finished: asyncio.Event,
+):
+    while True:
+        try:
+            event = await asyncio.wait_for(inbox.get(), 1.0)
+        except asyncio.TimeoutError:
+            if is_finished.is_set():
+                return
+            continue
+        LOG.debug("worker.event-start", name=name, sync_event=event)
+        result = await asyncio.to_thread(
+            sync_key,
+            source=event.source,
+            dest=event.dest,
+            key=event.key,
+            downloader=event.downloader,
+            uploader=event.uploader,
+        )
+        inbox.task_done()
+        LOG.debug("worker.event-done", name=name, sync_event=event, result=result)
+        await outbox.put(result)
+
+
+async def do_sync(
+    source: S3Prefix,
+    dest: S3Prefix,
+    comparison: Comparison,
+    uploader: Uploader,
+    downloader: Downloader,
+):
+    outbox: asyncio.Queue[SyncEvent] = asyncio.Queue()
+    inbox: asyncio.Queue[SyncResult] = asyncio.Queue()
+    is_finished = asyncio.Event()
+    workers = []
+    for i in range(psutil.cpu_count() * 2):
+        worker = asyncio.create_task(
+            sync_worker(
+                name=f"sync-worker-{i}",
+                inbox=outbox,
+                outbox=inbox,
+                is_finished=is_finished,
+            )
+        )
+        workers.append(worker)
+    with Progress() as progress:
+        syncs_task = progress.add_task("Syncs", total=len(comparison.to_sync))
+
+        for key in comparison.to_sync:
+            await outbox.put(
+                SyncEvent(
+                    source=source,
+                    dest=dest,
+                    key=key,
+                    downloader=downloader,
+                    uploader=uploader,
+                )
+            )
+
+        while True:
+            try:
+                result = await asyncio.wait_for(inbox.get(), 1.0)
+                LOG.info("sync.result", result=result)
+                progress.update(syncs_task, advance=1)
+            except asyncio.TimeoutError:
+                # Check if we've processed all events
+                if inbox.qsize() == 0 and outbox.qsize() == 0:
+                    await outbox.join()
+                    break
+    assert inbox.qsize() == 0
+    assert outbox.qsize() == 0
+
+
 @app.command()
 def sync(
     source: Annotated[S3Prefix, typer.Argument(parser=parse_prefix)],
@@ -93,12 +184,15 @@ def sync(
         downloader = DryRunDownloader
         uploader = DryRunUploader
 
-    with Progress() as progress:
-        syncs_task = progress.add_task("Syncs", total=len(comparison.to_sync))
-        for key in comparison.to_sync:
-            result = sync_key(source, dest, key, downloader, uploader)
-            LOG.info("sync.result", result=result)
-            progress.update(syncs_task, advance=1)
+    asyncio.run(
+        do_sync(
+            source=source,
+            dest=dest,
+            comparison=comparison,
+            uploader=uploader,
+            downloader=downloader,
+        )
+    )
 
 
 @app.callback()

@@ -86,11 +86,11 @@ def sync(
     downloader = S3Downloader
     uploader = S3Uploader
 
-    if dry_run:
-        downloader = DryRunDownloader
-        uploader = DryRunUploader
     if download_only:
         downloader = S3Downloader
+        uploader = DryRunUploader
+    if dry_run:
+        downloader = DryRunDownloader
         uploader = DryRunUploader
 
     with Progress() as progress:

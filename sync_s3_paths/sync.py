@@ -8,6 +8,7 @@ import base64
 
 import boto3
 import botocore.response
+import botocore.exceptions
 import structlog
 import psutil
 
@@ -49,6 +50,8 @@ class Comparison:
 
 @dataclass
 class SyncResult:
+    success: bool
+    error: str | None
     source: S3Prefix
     dest: S3Prefix
     bucket: str
@@ -75,6 +78,8 @@ Downloader = Callable[[S3Prefix, str], DownloadResult]
 
 @dataclass
 class UploadResult:
+    success: bool
+    error: str | None
     bucket: str
     key: str
     size: int
@@ -137,6 +142,8 @@ def DryRunUploader(
         sha256.update(chunk)
         md5.update(chunk)
     return UploadResult(
+        success=True,
+        error=None,
         bucket=prefix.bucket,
         key=prefix.get_key(key),
         size=downloaded.size,
@@ -184,22 +191,35 @@ def S3Uploader(prefix: S3Prefix, key: str, downloaded: DownloadResult) -> Upload
 
         buffer.seek(0)
 
-        response: S3PutObjectResponse = s3.put_object(
-            Bucket=prefix.bucket,
-            Body=buffer,
-            ContentLength=downloaded.size,
-            ContentType=downloaded.content_type,
-            Key=prefix.get_key(key),
-            Metadata=downloaded.metadata,
-            ChecksumSHA256=base64.b64encode(sha256.digest()).decode("ascii"),
-            ChecksumAlgorithm="SHA256",
-            ContentMD5=base64.b64encode(md5.digest()).decode("ascii"),
-        )
-        LOG.debug("s3.put-object.response", response=response)
+        success = True
+        error = None
+        full_key = prefix.get_key(key)
+        try:
+            response: S3PutObjectResponse = s3.put_object(
+                Bucket=prefix.bucket,
+                Body=buffer,
+                ContentLength=downloaded.size,
+                ContentType=downloaded.content_type,
+                Key=full_key,
+                Metadata=downloaded.metadata,
+                ChecksumSHA256=base64.b64encode(sha256.digest()).decode("ascii"),
+                ChecksumAlgorithm="SHA256",
+                ContentMD5=base64.b64encode(md5.digest()).decode("ascii"),
+            )
+            LOG.debug("s3.put-object.response", response=response)
+        except botocore.exceptions.ClientError as e:
+            success = False
+            error = str(e)
+        except Exception as e:
+            LOG.exception("s3.put-object.exception", bucket=prefix.bucket, key=full_key)
+            success = False
+            error = str(e)
         return UploadResult(
+            success=success,
+            error=error,
             bucket=prefix.bucket,
             size=downloaded.size,
-            key=prefix.get_key(key),
+            key=full_key,
             etag=response["ETag"],
             sha256=sha256.hexdigest(),
             md5=md5.hexdigest(),
@@ -284,6 +304,8 @@ def sync_key(
     uploaded = uploader(dest, key, downloaded)
     LOG.debug("uploaded", uploaded=uploaded)
     return SyncResult(
+        error=uploaded.error,
+        success=uploaded.success,
         source=source,
         dest=dest,
         bucket=uploaded.bucket,

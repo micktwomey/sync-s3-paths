@@ -251,9 +251,11 @@ def compare_buckets(source: S3Prefix, dest: S3Prefix, path: str) -> Comparison:
     for key_key in set(source_keys).intersection(set(dest_keys)):
         source_key = source_keys[key_key]
         dest_key = dest_keys[key_key]
+        LOG.debug("comparison.compare", source=source_key, dest=dest_key)
         if (source_key.size != dest_key.size) or (
             source_key.last_modified > dest_key.last_modified
         ):
+            LOG.debug("comparison.different", source=source_key, dest=dest_key)
             different.add(key_key)
         else:
             common.add(key_key)

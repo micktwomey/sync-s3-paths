@@ -23,6 +23,7 @@ from .sync import (
     compare_buckets,
     sync_key,
     SyncResult,
+    S3Client,
 )
 
 LOG: structlog.stdlib.BoundLogger = structlog.get_logger()
@@ -88,6 +89,7 @@ async def sync_worker(
     outbox: asyncio.Queue[SyncResult],
     is_finished: asyncio.Event,
 ):
+    s3_clients: dict[S3Prefix, S3Client] = {}
     while True:
         try:
             event = await asyncio.wait_for(inbox.get(), 1.0)
@@ -96,10 +98,16 @@ async def sync_worker(
                 return
             continue
         LOG.debug("worker.event-start", name=name, sync_event=event)
+        if event.source not in s3_clients:
+            s3_clients[event.source] = event.source.get_s3_client()
+        if event.dest not in s3_clients:
+            s3_clients[event.dest] = event.dest.get_s3_client()
         result = await asyncio.to_thread(
             sync_key,
             source=event.source,
+            source_s3_client=s3_clients[event.source],
             dest=event.dest,
+            dest_s3_client=s3_clients[event.dest],
             key=event.key,
             downloader=event.downloader,
             uploader=event.uploader,

@@ -23,7 +23,7 @@ class Key:
     last_modified: datetime.datetime
 
 
-@dataclass
+@dataclass(eq=True, frozen=True)
 class S3Prefix:
     profile: str | None
     bucket: str
@@ -31,6 +31,9 @@ class S3Prefix:
 
     def get_session(self) -> boto3.Session:
         return boto3.Session(profile_name=self.profile)
+
+    def get_s3_client(self) -> "S3Client":
+        return cast(S3Client, self.get_session().client("s3"))
 
     def get_key(self, key: str) -> str:
         return f"{self.prefix}/{key}"
@@ -92,7 +95,7 @@ class S3Client(Protocol):
         ...
 
 
-Downloader = Callable[[S3Prefix, str], DownloadResult]
+Downloader = Callable[[S3Prefix, str, S3Client | None], DownloadResult]
 
 
 @dataclass
@@ -107,10 +110,12 @@ class UploadResult:
     md5: str
 
 
-Uploader = Callable[[S3Prefix, str, DownloadResult], UploadResult]
+Uploader = Callable[[S3Prefix, str, DownloadResult, S3Client | None], UploadResult]
 
 
-def DryRunDownloader(prefix: S3Prefix, key: str) -> DownloadResult:
+def DryRunDownloader(
+    prefix: S3Prefix, key: str, s3_client: S3Client | None
+) -> DownloadResult:
     return DownloadResult(
         bucket=prefix.bucket,
         key=prefix.get_key(key),
@@ -130,10 +135,13 @@ class S3GetObjectResponse(TypedDict):
     Metadata: dict[str, str]
 
 
-def S3Downloader(prefix: S3Prefix, key: str) -> DownloadResult:
-    session = prefix.get_session()
-    s3: S3Client = cast(S3Client, session.client("s3"))
-    response: S3GetObjectResponse = s3.get_object(
+def S3Downloader(
+    prefix: S3Prefix, key: str, s3_client: S3Client | None
+) -> DownloadResult:
+    # session = prefix.get_session()
+    # s3: S3Client = cast(S3Client, session.client("s3"))
+    assert s3_client is not None
+    response: S3GetObjectResponse = s3_client.get_object(
         Bucket=prefix.bucket,
         Key=prefix.get_key(key),
     )
@@ -150,7 +158,7 @@ def S3Downloader(prefix: S3Prefix, key: str) -> DownloadResult:
 
 
 def DryRunUploader(
-    prefix: S3Prefix, key: str, downloaded: DownloadResult
+    prefix: S3Prefix, key: str, downloaded: DownloadResult, s3_client: S3Client | None
 ) -> UploadResult:
     sha256 = hashlib.sha256()
     md5 = hashlib.md5()
@@ -177,9 +185,12 @@ class S3PutObjectResponse(TypedDict):
     ChecksumSHA256: str
 
 
-def S3Uploader(prefix: S3Prefix, key: str, downloaded: DownloadResult) -> UploadResult:
-    session = prefix.get_session()
-    s3: S3Client = cast(S3Client, session.client("s3"))
+def S3Uploader(
+    prefix: S3Prefix, key: str, downloaded: DownloadResult, s3_client: S3Client | None
+) -> UploadResult:
+    # session = prefix.get_session()
+    # s3: S3Client = cast(S3Client, session.client("s3"))
+    assert s3_client is not None
     # We can't stream directly from a get object to a put object, boto3 tries to read the object to
     # calculate the MD5, then seek() back. To mitigate this try to read ourselves, spooling to disk
     # as needed.
@@ -214,7 +225,7 @@ def S3Uploader(prefix: S3Prefix, key: str, downloaded: DownloadResult) -> Upload
         error = None
         full_key = prefix.get_key(key)
         try:
-            response: S3PutObjectResponse = s3.put_object(
+            response: S3PutObjectResponse = s3_client.put_object(
                 Bucket=prefix.bucket,
                 Body=buffer,
                 ContentLength=downloaded.size,
@@ -313,14 +324,16 @@ def compare_buckets(source: S3Prefix, dest: S3Prefix, path: str) -> Comparison:
 
 def sync_key(
     source: S3Prefix,
+    source_s3_client: S3Client,
     dest: S3Prefix,
+    dest_s3_client: S3Client,
     key: str,
     downloader: Downloader,
     uploader: Uploader,
 ) -> SyncResult:
-    downloaded = downloader(source, key)
+    downloaded = downloader(source, key, source_s3_client)
     LOG.debug("downloaded", downloaded=downloaded)
-    uploaded = uploader(dest, key, downloaded)
+    uploaded = uploader(dest, key, downloaded, dest_s3_client)
     LOG.debug("uploaded", uploaded=uploaded)
     return SyncResult(
         error=uploaded.error,

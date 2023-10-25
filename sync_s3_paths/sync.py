@@ -224,6 +224,7 @@ def S3Uploader(
         success = True
         error = None
         full_key = prefix.get_key(key)
+        etag = None
         try:
             response: S3PutObjectResponse = s3_client.put_object(
                 Bucket=prefix.bucket,
@@ -237,6 +238,7 @@ def S3Uploader(
                 ContentMD5=base64.b64encode(md5.digest()).decode("ascii"),
             )
             LOG.debug("s3.put-object.response", response=response)
+            etag = response["ETag"]
         except botocore.exceptions.ClientError as e:
             success = False
             error = str(e)
@@ -250,7 +252,7 @@ def S3Uploader(
             bucket=prefix.bucket,
             size=downloaded.size,
             key=full_key,
-            etag=response["ETag"],
+            etag=etag,
             sha256=sha256.hexdigest(),
             md5=md5.hexdigest(),
         )

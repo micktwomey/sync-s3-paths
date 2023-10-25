@@ -201,7 +201,13 @@ async def do_sync(
                     running = False
     assert inbox.qsize() == 0, inbox.qsize()
     assert outbox.qsize() == 0, outbox.qsize()
-    LOG.info("synced", synced=successes, errors=errors)
+    LOG.info(
+        "synced",
+        synced=successes,
+        errors=errors,
+        only_in_destination=len(comparison.only_in_destination),
+        identical=len(comparison.common),
+    )
 
 
 @app.command()

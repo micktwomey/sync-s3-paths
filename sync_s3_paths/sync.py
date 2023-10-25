@@ -7,6 +7,7 @@ import tempfile
 import base64
 
 import boto3
+import boto3.s3.transfer
 import botocore.response
 import botocore.exceptions
 import structlog
@@ -61,8 +62,8 @@ class SyncResult:
     key: str
     size: int
     etag: str | None
-    sha256: str
-    md5: str
+    sha256: str | None
+    md5: str | None
 
 
 @dataclass
@@ -74,6 +75,12 @@ class DownloadResult:
     metadata: dict[str, str]
     etag: str | None
     data: botocore.response.StreamingBody | BufferedReader | BytesIO
+
+
+class S3UploadFileObjExtraArgs(TypedDict):
+    ContentType: str
+    Metadata: dict[str, str]
+    ChecksumAlgorithm: str
 
 
 class S3Client(Protocol):
@@ -94,6 +101,15 @@ class S3Client(Protocol):
     ) -> "S3PutObjectResponse":
         ...
 
+    def upload_fileobj(
+        self,
+        FileObj: IO[Any],
+        Bucket: str,
+        Key: str,
+        ExtraArgs: S3UploadFileObjExtraArgs,
+    ) -> None:
+        ...
+
 
 Downloader = Callable[[S3Prefix, str, S3Client | None], DownloadResult]
 
@@ -106,8 +122,8 @@ class UploadResult:
     key: str
     size: int
     etag: str | None
-    sha256: str
-    md5: str
+    sha256: str | None
+    md5: str | None
 
 
 Uploader = Callable[[S3Prefix, str, DownloadResult, S3Client | None], UploadResult]
@@ -226,19 +242,45 @@ def S3Uploader(
         full_key = prefix.get_key(key)
         etag = None
         try:
-            response: S3PutObjectResponse = s3_client.put_object(
-                Bucket=prefix.bucket,
-                Body=buffer,
-                ContentLength=downloaded.size,
-                ContentType=downloaded.content_type,
-                Key=full_key,
-                Metadata=downloaded.metadata,
-                ChecksumSHA256=base64.b64encode(sha256.digest()).decode("ascii"),
-                ChecksumAlgorithm="SHA256",
-                ContentMD5=base64.b64encode(md5.digest()).decode("ascii"),
-            )
-            LOG.debug("s3.put-object.response", response=response)
-            etag = response["ETag"]
+            # threshold from boto3.s3.transfer.TransferConfig().multipart_threshold
+            if downloaded.size >= 8 * (1024**2):
+                LOG.info(
+                    "s3.upload_fileobj.request",
+                    bucket=prefix.bucket,
+                    key=full_key,
+                    size=downloaded.size,
+                )
+                s3_client.upload_fileobj(
+                    buffer,
+                    prefix.bucket,
+                    full_key,
+                    ExtraArgs=dict(
+                        ContentType=downloaded.content_type,
+                        Metadata=downloaded.metadata,
+                        ChecksumAlgorithm="SHA256",
+                    ),
+                )
+                LOG.info(
+                    "s3.upload_fileobj.response",
+                    bucket=prefix.bucket,
+                    key=full_key,
+                    size=downloaded.size,
+                )
+            else:
+                response: S3PutObjectResponse = s3_client.put_object(
+                    Bucket=prefix.bucket,
+                    Body=buffer,
+                    ContentLength=downloaded.size,
+                    ContentType=downloaded.content_type,
+                    Key=full_key,
+                    Metadata=downloaded.metadata,
+                    ChecksumSHA256=base64.b64encode(sha256.digest()).decode("ascii"),
+                    ChecksumAlgorithm="SHA256",
+                    ContentMD5=base64.b64encode(md5.digest()).decode("ascii"),
+                )
+                LOG.debug("s3.put-object.response", response=response)
+                etag = response["ETag"]
+
         except botocore.exceptions.ClientError as e:
             success = False
             error = str(e)

@@ -102,19 +102,34 @@ async def sync_worker(
             s3_clients[event.source] = event.source.get_s3_client()
         if event.dest not in s3_clients:
             s3_clients[event.dest] = event.dest.get_s3_client()
-        result = await asyncio.to_thread(
-            sync_key,
-            source=event.source,
-            source_s3_client=s3_clients[event.source],
-            dest=event.dest,
-            dest_s3_client=s3_clients[event.dest],
-            key=event.key,
-            downloader=event.downloader,
-            uploader=event.uploader,
-        )
+        try:
+            result = await asyncio.to_thread(
+                sync_key,
+                source=event.source,
+                source_s3_client=s3_clients[event.source],
+                dest=event.dest,
+                dest_s3_client=s3_clients[event.dest],
+                key=event.key,
+                downloader=event.downloader,
+                uploader=event.uploader,
+            )
+        except Exception as e:
+            LOG.exception("error", worker=name, sync_event=event)
+            result = SyncResult(
+                error=str(e),
+                success=False,
+                bucket=event.dest.bucket,
+                dest=event.dest,
+                source=event.source,
+                etag=None,
+                key=event.key,
+                md5=None,
+                sha256=None,
+                size=0,
+            )
+        await outbox.put(result)
         inbox.task_done()
         LOG.debug("worker.event-done", name=name, sync_event=event, result=result)
-        await outbox.put(result)
 
 
 async def do_sync(
@@ -138,8 +153,11 @@ async def do_sync(
             )
         )
         workers.append(worker)
+    errors = 0
+    successes = 0
     with Progress() as progress:
-        syncs_task = progress.add_task("Syncs", total=len(comparison.to_sync))
+        tasks_remaining = len(comparison.to_sync)
+        syncs_task = progress.add_task("Syncs", total=tasks_remaining)
 
         for key in comparison.to_sync:
             await outbox.put(
@@ -152,22 +170,38 @@ async def do_sync(
                 )
             )
 
-        while True:
+        running = True
+        while running:
             try:
                 result = await asyncio.wait_for(inbox.get(), 1.0)
                 LOG.info("sync.result", result=result)
                 progress.update(syncs_task, advance=1)
+                if result.success:
+                    successes += 1
+                else:
+                    errors += 1
+                    LOG.error("error", error=result.error)
+                tasks_remaining -= 1
             except asyncio.TimeoutError:
                 # Check if we've processed all events
-                if inbox.qsize() == 0 and outbox.qsize() == 0:
+                if (
+                    (inbox.qsize() == 0)
+                    and (outbox.qsize() == 0)
+                    and (tasks_remaining == 0)
+                ):
                     is_finished.set()
                     await outbox.join()
                     for worker in workers:
                         worker.cancel()
-                    await asyncio.gather(*workers, return_exceptions=True)
-                    break
-    assert inbox.qsize() == 0
-    assert outbox.qsize() == 0
+                    for result in await asyncio.gather(
+                        *workers, return_exceptions=True
+                    ):
+                        if isinstance(result, Exception):
+                            LOG.error("shutdown.exception", exception=result)
+                    running = False
+    assert inbox.qsize() == 0, inbox.qsize()
+    assert outbox.qsize() == 0, outbox.qsize()
+    LOG.info("synced", synced=successes, errors=errors)
 
 
 @app.command()
@@ -184,6 +218,7 @@ def sync(
     ] = False,
 ):
     path = make_path_relative(path)
+    LOG.info("comparing-buckets", source=source, dest=dest, path=path)
     comparison = compare_buckets(source, dest, path)
 
     downloader = S3Downloader
@@ -196,6 +231,7 @@ def sync(
         downloader = DryRunDownloader
         uploader = DryRunUploader
 
+    LOG.info("syncing")
     asyncio.run(
         do_sync(
             source=source,

@@ -160,7 +160,11 @@ async def do_sync(
             except asyncio.TimeoutError:
                 # Check if we've processed all events
                 if inbox.qsize() == 0 and outbox.qsize() == 0:
+                    is_finished.set()
                     await outbox.join()
+                    for worker in workers:
+                        worker.cancel()
+                    await asyncio.gather(*workers, return_exceptions=True)
                     break
     assert inbox.qsize() == 0
     assert outbox.qsize() == 0
